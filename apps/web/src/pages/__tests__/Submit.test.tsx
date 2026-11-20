@@ -301,4 +301,49 @@ describe('Submit', () => {
     expect(alertBanner).toHaveTextContent('Failed to fetch');
     expect(screen.queryByText('View activity')).not.toBeInTheDocument();
   });
+
+  test('a 403 deny on trustline submit renders the policy decision reason and activity link', async () => {
+    const errorBody = {
+      activityId: 'act-tl-deny-789',
+      agentId: 'agent-1',
+      status: 'rejected',
+      error: 'Trustline asset not allowed',
+      policyDecision: {
+        result: 'deny',
+        reason: 'asset not in allowlist',
+        rule: 'allowedAssets',
+      },
+    };
+    mockSubmitTrustline.mockRejectedValue(
+      new ApiError(403, 'Trustline asset not allowed', 'POLICY_DENIED', undefined, errorBody)
+    );
+
+    renderSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Agent')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('Intent Type'), { target: { value: 'trustline' } });
+    fireEvent.change(screen.getByLabelText('Asset Code'), { target: { value: 'USDC' } });
+    fireEvent.change(screen.getByLabelText('Issuer (Stellar G...)'), { target: { value: 'GABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRS' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Add trustline' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Intent' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+
+    const alertBanner = screen.getByRole('alert');
+    expect(alertBanner).toHaveClass('error-banner');
+    expect(alertBanner).toHaveTextContent('asset not in allowlist');
+    expect(alertBanner).toHaveTextContent('act-tl-deny-789');
+
+    const activityLink = screen.getByText('View activity');
+    expect(activityLink).toBeInTheDocument();
+    expect(activityLink.closest('a')).toHaveAttribute(
+      'href',
+      '/agents/agent-1/activity/act-tl-deny-789'
+    );
+  });
 });
