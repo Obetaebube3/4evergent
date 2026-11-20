@@ -427,15 +427,11 @@ export function Modal({
         )
       );
 
+    const trigger = document.activeElement;
     const first = focusable()[0];
     first?.focus();
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-        return;
-      }
       if (e.key !== 'Tab') return;
       const items = focusable();
       if (items.length === 0) return;
@@ -451,8 +447,11 @@ export function Modal({
     };
 
     node.addEventListener('keydown', onKeyDown);
-    return () => node.removeEventListener('keydown', onKeyDown);
-  }, [open, onClose]);
+    return () => {
+      node.removeEventListener('keydown', onKeyDown);
+      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
+    };
+  }, [open]);
 
   if (!open) return null;
 
@@ -464,9 +463,35 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            onClose();
+          }
+        }}
       >
         {children}
       </div>
     </div>
+  );
+}
+
+export function ConfirmationModal({ title, actionLabel, onCancel, onConfirm }: {
+  title: string;
+  actionLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const titleId = React.useId();
+
+  return (
+    <Modal open titleId={titleId} onClose={onCancel}>
+      <h2 id={titleId}>{title}</h2>
+      <p>This cannot be undone.</p>
+      <div className="form-actions">
+        <button type="button" className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+        <button type="button" className="btn btn-danger" onClick={onConfirm}>{actionLabel}</button>
+      </div>
+    </Modal>
   );
 }

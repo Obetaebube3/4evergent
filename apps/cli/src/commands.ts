@@ -105,7 +105,9 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
     agent: {
       name: "agent",
       description: "Manage agents and their status",
-      usage: "Usage: 4evergent agent <list|get|create|pause|resume|disable> [id]",
+      usage:
+        "Usage: 4evergent agent <list|get|create|pause|resume|disable> [id]\n" +
+        "       4evergent agent disable <id> [--force|--yes]",
       reportUnknownSubcommand: true,
       subcommands: {
         list: {
@@ -144,8 +146,9 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
         },
         disable: {
           name: "disable",
-          description: "Disable agent",
+          description: "Disable an agent permanently; use --force or --yes to skip confirmation",
           args: [{ name: "id", description: "Agent ID" }],
+          flags: ["--force", "--yes"],
           run: handlers ? (args) => handlers.agent.disable(args) : undefined,
         },
       },
@@ -263,7 +266,9 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
     schedule: {
       name: "schedule",
       description: "Manage recurring agent schedules",
-      usage: "Usage: 4evergent schedule <list|get|create|update|pause|resume|disable|delete> [args...]",
+      usage:
+        "Usage: 4evergent schedule <list|get|create|update|pause|resume|disable|delete> [args...]\n" +
+        "       4evergent schedule delete <agent-id> <schedule-id> [--force|--yes]",
       reportUnknownSubcommand: false,
       subcommands: {
         list: {
@@ -292,6 +297,7 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
             { name: "expression", description: "Cron expression (5 fields)" },
             { name: "type", description: "Intent type", values: INTENT_TYPES },
           ],
+          flags: ["--issuer", "--timezone"],
           run: handlers ? (args) => handlers.schedule.create(args) : undefined,
         },
         update: {
@@ -333,11 +339,12 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
         },
         delete: {
           name: "delete",
-          description: "Delete a schedule",
+          description: "Delete a schedule permanently; use --force or --yes to skip confirmation",
           args: [
             { name: "agent-id", description: "Agent ID" },
             { name: "schedule-id", description: "Schedule ID" },
           ],
+          flags: ["--force", "--yes"],
           run: handlers ? (args) => handlers.schedule.delete(args) : undefined,
         },
       },
@@ -346,7 +353,7 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
       name: "intent",
       description: "Submit transactional intents",
       usage:
-        "Usage: 4evergent intent submit <agent-id> <type> [args...] [--idempotency-key <key>]\nTypes: payment | trustline | contract_call",
+        "Usage: 4evergent intent submit <agent-id> <type> [args...] [--issuer <G...>] [--idempotency-key <key>]\nTypes: payment | trustline | contract_call",
       reportUnknownSubcommand: false,
       subcommands: {
         submit: {
@@ -360,7 +367,7 @@ export function buildCommandTree(handlers?: CommandTreeHandlers): CommandTree {
               values: INTENT_TYPES,
             },
           ],
-          flags: ["--idempotency-key"],
+          flags: ["--idempotency-key", "--issuer"],
           run: handlers ? (args) => handlers.intent.submit(args) : undefined,
         },
       },
@@ -400,13 +407,13 @@ export const COMMANDS_HELP = [
   "Commands:",
   "  --version, -v  Print the CLI package version",
   "  health",
-  "  agent list | get <id> | create <name> | pause <id> | resume <id> | disable <id>",
+  "  agent list | get <id> | create <name> | pause <id> | resume <id> | disable <id> [--force|--yes]",
   "  approval list | approve <id> | reject <id>",
   "  execution list | get <id> | retry <id> | cancel <id>",
   "  policy get <agent-id> | update <agent-id>",
   "  activity list <agent-id> [limit] | get <agent-id> <activity-id>",
-  "  schedule list <agent-id> [limit] | get <agent-id> <schedule-id> | create <agent-id> <cron> <intent> | update <agent-id> <schedule-id> <cron> | pause <agent-id> <schedule-id> | resume <agent-id> <schedule-id> | disable <agent-id> <schedule-id> | delete <agent-id> <schedule-id>",
-  "  intent submit <agent-id> <type> [args...] [--idempotency-key <key>]",
+  "  schedule list <agent-id> [limit] | get <agent-id> <schedule-id> | create <agent-id> <cron> <intent> [--issuer <G...>] [--timezone <tz>] | update <agent-id> <schedule-id> <cron> | pause <agent-id> <schedule-id> | resume <agent-id> <schedule-id> | disable <agent-id> <schedule-id> | delete <agent-id> <schedule-id> [--force|--yes]",
+  "  intent submit <agent-id> <type> [args...] [--issuer <G...>] [--idempotency-key <key>]",
   "  completion bash | zsh",
 ].join("\n");
 

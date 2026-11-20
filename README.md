@@ -177,7 +177,7 @@ pnpm --filter @4evergent/api dev
 pnpm --filter @4evergent/web dev
 ```
 
-The dashboard connects to `http://localhost:3000`. Set `VITE_API_BASE` env var to point to a different API URL. The dashboard is a local development tool — it provides read-only views of agents/activity/approvals and an XLM payment intent submission form. All policy enforcement, signing, and submission remain server-side.
+The dashboard connects to `http://localhost:3000`. Set `VITE_API_BASE` env var to point to a different API URL. The local development dashboard shows agent activity and lets operators review approvals and submit XLM payment intents. Rejecting an approval or deleting a recurring schedule opens a confirmation dialog. Choose Cancel or press Escape to keep the record. All policy enforcement, signing, and submission remain server-side.
 
 Each package has its own `package.json` with `build`, `dev`, `test`, and `typecheck` scripts.
 

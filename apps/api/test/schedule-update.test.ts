@@ -229,18 +229,100 @@ test("PATCH /agents/:id/schedules/:id — empty scheduleExpression returns 400",
   }
 });
 
-// ===== TEST 9: PATCH WITHOUT scheduleExpression FIELD =====
-test("PATCH /agents/:id/schedules/:id — patch without scheduleExpression returns 200 without mutating", async () => {
+// ===== TEST 9: EMPTY BODY REJECTED — issue #388 =====
+// Before the fix, {} produced 200 and bumped updatedAt even though nothing changed.
+test("PATCH /agents/:id/schedules/:id — empty body returns 400 VALIDATION_ERROR and does not bump updatedAt", async () => {
   const store = new InMemoryScheduleStore();
   const schedule = makeSchedule({ scheduleExpression: "0 * * * *" });
   await store.create(schedule);
 
-  const { baseUrl, close } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
 
   try {
     const res = await patchSchedule(baseUrl, "test-agent", schedule.id, {});
-    assert.equal(res.status, 200);
-    assert.equal(res.body.schedule.scheduleExpression, "0 * * * *");
+    assert.equal(res.status, 400);
+    assert.equal(res.body.code, "VALIDATION_ERROR");
+    assert.ok(res.body.error.includes("scheduleExpression"), `error message should name accepted field, got: ${res.body.error}`);
+
+    // updatedAt must not have changed
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.updatedAt, schedule.updatedAt, "updatedAt must not change on rejected no-op");
+    assert.equal(after?.scheduleExpression, "0 * * * *");
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 9b: UNKNOWN-ONLY FIELD REJECTED — issue #388 =====
+// {"cronExpression": "..."} is a natural typo for scheduleExpression.
+// Before the fix this silently returned 200 and left the schedule unchanged.
+test("PATCH /agents/:id/schedules/:id — unknown-field-only body returns 400 naming the accepted field", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({ scheduleExpression: "0 * * * *" });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    // Typo: "cronExpression" instead of "scheduleExpression"
+    const res = await patchSchedule(baseUrl, "test-agent", schedule.id, { cronExpression: "0 9 * * *" });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.code, "VALIDATION_ERROR");
+    assert.ok(res.body.error.includes("scheduleExpression"), `error should name the accepted field, got: ${res.body.error}`);
+
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.updatedAt, schedule.updatedAt, "updatedAt must not change on rejected body");
+    assert.equal(after?.scheduleExpression, "0 * * * *");
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 9c: MIXED VALID + UNKNOWN FIELDS REJECTED — issue #388 =====
+// A body with scheduleExpression AND unknown keys is rejected — strict,
+// consistent behaviour: the caller sent something unrecognised.
+test("PATCH /agents/:id/schedules/:id — body mixing scheduleExpression with unknown fields returns 400", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({ scheduleExpression: "0 * * * *" });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    const res = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      scheduleExpression: "*/5 * * * *",
+      amount: "5",
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.code, "VALIDATION_ERROR");
+    assert.ok(res.body.error.includes("amount"), `error should name the unknown field, got: ${res.body.error}`);
+
+    // schedule must be untouched
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.updatedAt, schedule.updatedAt, "updatedAt must not change on rejected body");
+    assert.equal(after?.scheduleExpression, "0 * * * *");
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 9d: IMMUTABLE-FIELD TYPO REJECTED — issue #388 =====
+// {"amount": "5"} looks plausible but names an immutable field — 400.
+test("PATCH /agents/:id/schedules/:id — body with only an immutable field returns 400 naming scheduleExpression", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({ scheduleExpression: "0 * * * *" });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    const res = await patchSchedule(baseUrl, "test-agent", schedule.id, { amount: "5" });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.code, "VALIDATION_ERROR");
+    assert.ok(res.body.error.includes("scheduleExpression"), `error should name accepted field, got: ${res.body.error}`);
+
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.updatedAt, schedule.updatedAt, "updatedAt must not change on rejected body");
   } finally {
     await close();
   }
@@ -341,6 +423,116 @@ test("PATCH scheduleExpression → scheduler runs at NEW time, not old", async (
     // --- Step 5: execution is for the right schedule/agent ---
     assert.equal(executed[0], schedule.id);
     assert.equal(executed[1], schedule.id);
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 12: UPDATE INTENT AMOUNT LEAVES nextRunAt UNCHANGED AND PRESERVES HISTORY =====
+test("PATCH /agents/:id/schedules/:id — updating intent.amount persists, leaves nextRunAt unchanged, preserves lastRunAt and createdAt", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({
+    scheduleExpression: "0 * * * *",
+    nextRunAt: "2099-01-01T00:00:00Z",
+    lastRunAt: "2025-12-31T23:00:00Z",
+    createdAt: "2025-01-01T00:00:00Z",
+  });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    const res = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      intent: { amount: "20" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.schedule.intent.amount, "20");
+    assert.equal(res.body.schedule.intent.asset, schedule.intent.asset);
+    assert.equal(res.body.schedule.intent.destination, schedule.intent.destination);
+    assert.equal(res.body.schedule.intent.reason, schedule.intent.reason);
+    assert.equal(res.body.schedule.nextRunAt, "2099-01-01T00:00:00Z");
+    assert.equal(res.body.schedule.lastRunAt, "2025-12-31T23:00:00Z");
+    assert.equal(res.body.schedule.createdAt, "2025-01-01T00:00:00Z");
+
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.intent.amount, "20");
+    assert.equal(after?.nextRunAt, "2099-01-01T00:00:00Z");
+    assert.equal(after?.lastRunAt, "2025-12-31T23:00:00Z");
+    assert.equal(after?.createdAt, "2025-01-01T00:00:00Z");
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 13: UPDATE TIMEZONE RECOMPUTES nextRunAt =====
+test("PATCH /agents/:id/schedules/:id — updating timezone persists and recomputes nextRunAt", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({
+    scheduleExpression: "0 12 * * *",
+    timezone: "UTC",
+    nextRunAt: "2099-01-01T00:00:00Z",
+    lastRunAt: "2025-12-31T12:00:00Z",
+  });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    const res = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      timezone: "America/New_York",
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.schedule.timezone, "America/New_York");
+    assert.notEqual(res.body.schedule.nextRunAt, "2099-01-01T00:00:00Z");
+    assert.equal(res.body.schedule.lastRunAt, "2025-12-31T12:00:00Z");
+
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.timezone, "America/New_York");
+    assert.notEqual(after?.nextRunAt, "2099-01-01T00:00:00Z");
+  } finally {
+    await close();
+  }
+});
+
+// ===== TEST 14: INVALID AMOUNT, DESTINATION, AND TIMEZONE REJECTED =====
+test("PATCH /agents/:id/schedules/:id — invalid amount, destination, or timezone returns 400 and does not mutate", async () => {
+  const store = new InMemoryScheduleStore();
+  const schedule = makeSchedule({
+    scheduleExpression: "0 * * * *",
+    timezone: "UTC",
+    nextRunAt: "2099-01-01T00:00:00Z",
+  });
+  await store.create(schedule);
+
+  const { baseUrl, close, scheduleStore } = await startServer({ scheduleStore: store, policyRules: { maxTxAmount: { XLM: "1000" } }, deferExecution: true });
+
+  try {
+    // Invalid amount
+    const badAmount = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      intent: { amount: "-5" },
+    });
+    assert.equal(badAmount.status, 400);
+    assert.equal(badAmount.body.code, "VALIDATION_ERROR");
+
+    // Invalid destination
+    const badDest = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      intent: { destination: "not-a-stellar-address" },
+    });
+    assert.equal(badDest.status, 400);
+    assert.equal(badDest.body.code, "VALIDATION_ERROR");
+
+    // Invalid timezone
+    const badTz = await patchSchedule(baseUrl, "test-agent", schedule.id, {
+      timezone: "Mars/Olympus_Mons",
+    });
+    assert.equal(badTz.status, 400);
+    assert.equal(badTz.body.code, "VALIDATION_ERROR");
+
+    const after = await scheduleStore.get(schedule.id);
+    assert.equal(after?.intent.amount, "10");
+    assert.equal(after?.intent.destination, schedule.intent.destination);
+    assert.equal(after?.timezone, "UTC");
+    assert.equal(after?.updatedAt, schedule.updatedAt);
   } finally {
     await close();
   }

@@ -14,6 +14,7 @@
 
 import { exit } from "node:process";
 import { createRequire } from "node:module";
+import { createInterface } from "node:readline";
 import { COMMAND_TREE, COMMANDS_HELP, buildCommandTree, dispatchCommand } from "./commands.js";
 import { generateCompletion } from "./completion.js";
 
@@ -221,12 +222,80 @@ async function cmdAgentGet(agentId: string) {
   }
 }
 
-async function cmdAgentStatus(agentId: string, status: "active" | "paused" | "disabled") {
+interface DestructiveConfirmationOptions {
+  force: boolean;
+  isTTY?: boolean;
+  input?: NodeJS.ReadableStream;
+  output?: NodeJS.WritableStream;
+}
+
+async function confirmDestructiveAction(
+  target: string,
+  consequence: string,
+  options: DestructiveConfirmationOptions
+): Promise<boolean> {
+  if (options.force) return true;
+
+  if (!(options.isTTY ?? Boolean(process.stdin.isTTY))) {
+    console.error("Refusing destructive action: stdin is not a TTY. Rerun with --force or --yes to proceed.");
+    return false;
+  }
+
+  const rl = createInterface({
+    input: options.input ?? process.stdin,
+    output: options.output ?? process.stderr,
+  });
+  const confirmed = await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (answer: boolean) => {
+      if (settled) return;
+      settled = true;
+      rl.close();
+      resolve(answer);
+    };
+
+    rl.once("close", () => {
+      if (!settled) {
+        settled = true;
+        resolve(false);
+      }
+    });
+    rl.once("SIGINT", () => finish(false));
+    rl.question(
+      `${consequence}\n  Target: ${target}\nThis action cannot be undone. Continue? [y/N] `,
+      (answer) => finish(/^(y|yes)$/i.test(answer.trim()))
+    );
+  });
+
+  return confirmed;
+}
+
+async function cmdAgentStatus(agentId: string, status: "active" | "paused" | "disabled", force = false) {
   if (!agentId) {
-    console.error("Usage: 4evergent agent <pause|resume|disable> <id>");
+    console.error(
+      status === "disabled"
+        ? "Usage: 4evergent agent disable <id> [--force|--yes]"
+        : "Usage: 4evergent agent <pause|resume> <id>"
+    );
     return 1;
   }
   try {
+    if (status === "disabled") {
+      if (!force && !process.stdin.isTTY) {
+        console.error("Refusing destructive action: stdin is not a TTY. Rerun with --force or --yes to proceed.");
+        return 1;
+      }
+      if (!force) {
+        const { body: agent } = await request(`/agents/${encodeURIComponent(agentId)}`);
+        const target = `${agent.displayName ?? "(unnamed agent)"} (ID: ${agent.id ?? agentId})`;
+        const confirmed = await confirmDestructiveAction(target, "Disable this agent permanently?", { force });
+        if (!confirmed) {
+          console.error("Aborted; no changes made.");
+          return 1;
+        }
+      }
+    }
+
     const { body } = await request(`/agents/${encodeURIComponent(agentId)}/status`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -414,6 +483,12 @@ function formatSchedule(s: any) {
 `;
 }
 
+const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+
+function isValidStellarAddress(value: string): boolean {
+  return STELLAR_ADDRESS_RE.test(value);
+}
+
 /**
  * Build a typed intent object from CLI args.
  * Mirrors the AgentIntent union consumed by POST /agents/:id/intents.
@@ -426,14 +501,71 @@ function buildIntentArgs(args: string[]): { intent: any; error?: string } {
 
   switch (type) {
     case "payment": {
-      const [, asset, amount, destination, reason, memo] = args;
-      if (!asset || !amount || !destination || !reason) {
-        return { intent: null, error: "payment requires: <asset> <amount> <destination> <reason> [memo]" };
+      let issuer: string | undefined;
+      const positional: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--issuer") {
+          const val = args[i + 1];
+          if (!val || val.startsWith("--")) {
+            return { intent: null, error: "--issuer requires a Stellar address (G...)" };
+          }
+          issuer = val;
+          i++;
+        } else if (arg.startsWith("--issuer=")) {
+          const val = arg.slice("--issuer=".length);
+          if (!val) {
+            return { intent: null, error: "--issuer requires a Stellar address (G...)" };
+          }
+          issuer = val;
+        } else {
+          positional.push(arg);
+        }
       }
+
+      const [asset, amount, destination, reason, memo] = positional;
+      if (!asset || !amount || !destination || !reason) {
+        return {
+          intent: null,
+          error: "payment requires: <asset> <amount> <destination> <reason> [memo] [--issuer <G...>]",
+        };
+      }
+
+      if (asset === "XLM") {
+        if (issuer !== undefined) {
+          return { intent: null, error: "--issuer is not valid for native XLM payments" };
+        }
+        return {
+          intent: {
+            type: "payment",
+            asset,
+            destination,
+            amount,
+            reason,
+            ...(memo ? { memo } : {}),
+          },
+        };
+      }
+
+      if (!issuer) {
+        return {
+          intent: null,
+          error: `non-native asset '${asset}' requires an issuer (--issuer <G...>)`,
+        };
+      }
+
+      if (!isValidStellarAddress(issuer)) {
+        return {
+          intent: null,
+          error: `invalid --issuer '${issuer}': must be a valid Stellar address (56-character G... address)`,
+        };
+      }
+
       return {
         intent: {
           type: "payment",
           asset,
+          assetDetails: { code: asset, issuer },
           destination,
           amount,
           reason,
@@ -592,7 +724,7 @@ async function cmdScheduleGet(agentId: string, scheduleId: string) {
 
 async function cmdIntentSubmit(agentId: string, args: string[], idempotencyKey: string | null) {
   if (!agentId) {
-    console.error("Usage: 4evergent intent submit <agent-id> <type> [args...] [--idempotency-key <key>]");
+    console.error("Usage: 4evergent intent submit <agent-id> <type> [args...] [--issuer <G...>] [--idempotency-key <key>]");
     console.error("Types: payment | trustline | contract_call");
     return 1;
   }
@@ -602,7 +734,7 @@ async function cmdIntentSubmit(agentId: string, args: string[], idempotencyKey: 
   const flagIdx = args.indexOf("--idempotency-key");
   if (flagIdx !== -1) {
     key = args[flagIdx + 1] ?? null;
-    args = args.slice(0, flagIdx);
+    args = [...args.slice(0, flagIdx), ...args.slice(flagIdx + 2)];
   }
 
   const { intent, error } = buildIntentArgs(args);
@@ -686,9 +818,22 @@ async function cmdAgentCreate(args: string[]) {
   }
 }
 
+const RECOGNIZED_POLICY_FIELDS = [
+  "maxTxAmount",
+  "dailySpendingLimit",
+  "allowedAssets",
+  "allowedDestinations",
+  "allowedContractIds",
+  "txTypeRestrictions",
+  "approvalThreshold",
+  "requireHumanApprovalForAmountAbove",
+] as const;
+
 async function cmdPolicyUpdate(agentId: string, args: string[]) {
   if (!agentId) {
     console.error("Usage: 4evergent policy update <agent-id> --rules '<json>'");
+    console.error(`  --rules must be a JSON object with at least one policy field: ${RECOGNIZED_POLICY_FIELDS.join(", ")}`);
+    console.error("  Note: pass the inner 'policy' object, not the 'policy get' envelope ({ agentId, policy, version, updatedAt }).");
     return 1;
   }
   const idx = args.indexOf("--rules");
@@ -704,13 +849,34 @@ async function cmdPolicyUpdate(agentId: string, args: string[]) {
     return 1;
   }
 
+  if (typeof policy !== "object" || policy === null || Array.isArray(policy)) {
+    console.error(`Error: --rules must be a JSON object containing at least one recognized policy field (${RECOGNIZED_POLICY_FIELDS.join(", ")})`);
+    return 1;
+  }
+
+  const hasRecognizedField = RECOGNIZED_POLICY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(policy, field));
+  if (!hasRecognizedField) {
+    if (typeof policy.policy === "object" && policy.policy !== null && !Array.isArray(policy.policy)) {
+      console.error(
+        "Error: --rules appears to be a 'policy get' envelope ({ agentId, policy, version, updatedAt }). " +
+          "Pass the inner 'policy' object instead."
+      );
+      return 1;
+    }
+    console.error(
+      `Error: --rules contains no recognized policy fields. ` +
+        `Expected at least one of: ${RECOGNIZED_POLICY_FIELDS.join(", ")}`
+    );
+    return 1;
+  }
+
   try {
     const { body } = await request(`/agents/${encodeURIComponent(agentId)}/policy`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(policy),
     });
-    console.log(`Policy updated:\n  Agent: ${body.agentId}\n  Version: ${body.version}`);
+    console.log(`Policy updated:\n${formatPolicy(body)}`);
     return 0;
   } catch (err: any) {
     console.error(`Error: ${err.message}`);
@@ -720,7 +886,7 @@ async function cmdPolicyUpdate(agentId: string, args: string[]) {
 
 async function cmdScheduleCreate(agentId: string, args: string[]) {
   if (!agentId || args.length < 2) {
-    console.error("Usage: 4evergent schedule create <agent-id> <cron-expression> <intent-type> [intent-args...] [--timezone UTC]");
+    console.error("Usage: 4evergent schedule create <agent-id> <cron-expression> <intent-type> [intent-args...] [--issuer <G...>] [--timezone UTC]");
     return 1;
   }
   const expression = args[0];
@@ -831,12 +997,29 @@ async function cmdScheduleDisable(agentId: string, scheduleId: string) {
   }
 }
 
-async function cmdScheduleDelete(agentId: string, scheduleId: string) {
+async function cmdScheduleDelete(agentId: string, scheduleId: string, force = false) {
   if (!agentId || !scheduleId) {
-    console.error("Usage: 4evergent schedule delete <agent-id> <schedule-id>");
+    console.error("Usage: 4evergent schedule delete <agent-id> <schedule-id> [--force|--yes]");
     return 1;
   }
   try {
+    if (!force && !process.stdin.isTTY) {
+      console.error("Refusing destructive action: stdin is not a TTY. Rerun with --force or --yes to proceed.");
+      return 1;
+    }
+    if (!force) {
+      const { body } = await request(
+        `/agents/${encodeURIComponent(agentId)}/schedules/${encodeURIComponent(scheduleId)}`
+      );
+      const schedule = body.schedule ?? body;
+      const target = `${schedule.scheduleExpression ?? "(unknown expression)"} (ID: ${schedule.id ?? scheduleId})`;
+      const confirmed = await confirmDestructiveAction(target, "Delete this schedule permanently?", { force });
+      if (!confirmed) {
+        console.error("Aborted; no changes made.");
+        return 1;
+      }
+    }
+
     await request(`/agents/${encodeURIComponent(agentId)}/schedules/${encodeURIComponent(scheduleId)}`, {
       method: "DELETE",
     });
@@ -862,7 +1045,10 @@ export const dispatcherTree = buildCommandTree({
     create: (args) => cmdAgentCreate(args),
     pause: (args) => cmdAgentStatus(args[0] ?? "", "paused"),
     resume: (args) => cmdAgentStatus(args[0] ?? "", "active"),
-    disable: (args) => cmdAgentStatus(args[0] ?? "", "disabled"),
+    disable: (args) => {
+      const force = args.some((arg) => arg === "--force" || arg === "--yes");
+      return cmdAgentStatus(args.find((arg) => arg !== "--force" && arg !== "--yes") ?? "", "disabled", force);
+    },
   },
   approval: {
     list: () => cmdApprovalList(),
@@ -892,7 +1078,11 @@ export const dispatcherTree = buildCommandTree({
     pause: (args) => cmdSchedulePause(args[0] ?? "", args[1] ?? ""),
     resume: (args) => cmdScheduleResume(args[0] ?? "", args[1] ?? ""),
     disable: (args) => cmdScheduleDisable(args[0] ?? "", args[1] ?? ""),
-    delete: (args) => cmdScheduleDelete(args[0] ?? "", args[1] ?? ""),
+    delete: (args) => {
+      const positionalArgs = args.filter((arg) => arg !== "--force" && arg !== "--yes");
+      const force = positionalArgs.length !== args.length;
+      return cmdScheduleDelete(positionalArgs[0] ?? "", positionalArgs[1] ?? "", force);
+    },
   },
   intent: {
     submit: (args) => cmdIntentSubmit(args[0] ?? "", args.slice(1), null),

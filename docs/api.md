@@ -175,7 +175,13 @@ the Bearer integration surface. The document lists them under
 
 ### GET /health
 
-Public (no authentication). Returns `{"status":"ok","signerAccountId":"G..."}`.
+Public (no authentication). Returns `{"status":"ok","signerAccountId":"G...","version":"0.3.0","schemaVersion":5}`:
+
+- `status`: `"ok"`.
+- `signerAccountId`: configured Stellar signer public key.
+- `version`: running API package version (from `apps/api/package.json`).
+- `schemaVersion`: live SQLite `_meta.schema_version` integer for file-backed databases, or `null` when running in-memory.
+
 This liveness response stays unconditional and performs no dependency checks.
 
 ### GET /health/ready
@@ -484,6 +490,12 @@ Single schedule (owner-scoped). Returns `{ "schedule": ScheduleRecord }`.
 
 Update a schedule's `scheduleExpression` (re-validated against the
 schedule's timezone). `200` → `{ "schedule" }`.
+
+**Accepted fields:** `scheduleExpression` only. Any other fields — including
+unknown keys and plausible-but-wrong names such as `cronExpression` — cause a
+`400 VALIDATION_ERROR` naming `scheduleExpression` as the accepted field. An
+empty body `{}` is also rejected with `400 VALIDATION_ERROR`. This prevents
+silent no-ops: a `200` response always means the schedule changed.
 
 ### DELETE /agents/:id/schedules/:scheduleId
 

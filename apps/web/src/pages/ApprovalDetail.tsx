@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { api } from '../api';
 import { describeApiError } from '../apiErrors';
 import type { ApprovalRecord } from '../types';
-import { StatusBadge, Skeleton, EmptyState, DetailCard } from '../components';
+import { ConfirmationModal, StatusBadge, Skeleton, EmptyState, DetailCard } from '../components';
 
 export default function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -11,6 +11,7 @@ export default function ApprovalDetail() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [rejectId, setRejectId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -48,7 +49,7 @@ export default function ApprovalDetail() {
 
   const handleReject = async () => {
     if (!approval || actionLoading) return;
-    if (!confirm('Reject this approval? This cannot be undone.')) return;
+    setRejectId(null);
     setActionLoading('reject');
     setActionError(null);
     try {
@@ -72,7 +73,8 @@ export default function ApprovalDetail() {
     <EmptyState title="Approval not found" message="This approval does not exist or you do not have access." />
   );
 
-  const isPending = approval.status === 'pending_approval';
+  const isExpired = approval.status === 'expired' || (approval.expiresAt ? new Date(approval.expiresAt) <= new Date() : false);
+  const isPending = approval.status === 'pending_approval' && !isExpired;
   const canApprove = isPending;
   const canReject = isPending;
 
@@ -89,7 +91,7 @@ export default function ApprovalDetail() {
       </div>
 
       <div className="detail-grid">
-        <DetailCard title="Status"><StatusBadge status={approval.status} /></DetailCard>
+        <DetailCard title="Status"><StatusBadge status={isExpired ? 'expired' : approval.status} /></DetailCard>
         <DetailCard title="Agent"><code>{approval.agentId}</code></DetailCard>
         <DetailCard title="Activity"><code>{approval.activityId.slice(0, 8)}</code></DetailCard>
         <DetailCard title="Intent Type">{approval.intent.type}</DetailCard>
@@ -118,11 +120,15 @@ export default function ApprovalDetail() {
           </button>
         )}
         {canReject && (
-          <button className="btn btn-danger" disabled={actionLoading !== null} onClick={handleReject}>
+          <button className="btn btn-danger" disabled={actionLoading !== null} onClick={() => setRejectId(approval.id)}>
             {actionLoading === 'reject' ? 'Rejecting...' : 'Reject'}
           </button>
         )}
       </div>
+      {canReject && rejectId === approval.id && (
+        <ConfirmationModal title="Reject this approval?" actionLabel="Reject"
+          onCancel={() => setRejectId(null)} onConfirm={handleReject} />
+      )}
     </section>
   );
 }

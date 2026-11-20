@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createRequire } from "node:module";
 import { log, generateRequestId, runRequestIdContext } from "./logging.js";
 import type {
   AgentIntent,
@@ -20,7 +21,7 @@ import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
 import { TransactionStatusReconciler, ApprovalRecoveryService, DEFAULT_SUBMITTED_MAX_AGE_MS } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
-import type { ExecutionRecord, ExecutionStatus } from "@4evergent/database";
+import type { ExecutionRecord, ExecutionStatus, ScheduleRecord } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
 import {
   InMemoryActivityStore,
@@ -39,6 +40,8 @@ import {
   assertNoSecrets,
   validateApprovalTransition,
   ResourceAuthorizationService,
+  classifyPipelineOutcome,
+  classifyError,
   type AuthorizationContext,
   type ActivityStore,
   type ApprovalStore,
@@ -51,10 +54,15 @@ import {
   createActivity,
   isOffsetAtCeiling,
   clampOffset,
+  getSharedConnection,
+  getSchemaVersion,
 } from "@4evergent/database";
 import type { PolicyRules, Agent, RequestContext, AuthorizationService, AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
 import { createAuthModule, type PrincipalResolution } from "./auth.js";
 import { sweepRetainedData } from "./data-retention.js";
+
+const require = createRequire(import.meta.url);
+export const API_VERSION: string = (require("../package.json") as { version: string }).version;
 
 const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
 
@@ -567,14 +575,14 @@ export async function createApiServer(options: ServerOptions) {
           }
           const txHash = (outcome as { txHash?: string }).txHash;
           if (txHash) {
-            context?.onSubmitted?.(txHash);
+            await context?.onSubmitted?.(txHash);
           }
           return {
             record,
             success: outcome.status === "submitted",
             status: outcome.status,
             error: outcome.message,
-            errorClass: outcome.status === "rejected" ? "permanent" as const : "transient" as const,
+            errorClass: classifyPipelineOutcome(outcome),
             txHash,
             submittedHash: txHash ?? null,
             activityId: (outcome as { activityId?: string }).activityId ?? record.activityId ?? undefined,
@@ -613,7 +621,7 @@ export async function createApiServer(options: ServerOptions) {
             success: false,
             status: "failed",
             error: err instanceof Error ? err.message : String(err),
-            errorClass: "transient" as const,
+            errorClass: classifyError(err),
             activityId: record.activityId ?? undefined,
           };
         }
@@ -746,7 +754,23 @@ export async function createApiServer(options: ServerOptions) {
               createdAt: now,
               updatedAt: now,
             };
-            void executionQueue.enqueue(executionRecord);
+            try {
+              await executionQueue.enqueue(executionRecord);
+            } catch (err) {
+              console.error(`[scheduler] failed to enqueue execution for schedule ${schedule.id}:`, err);
+              if (store) {
+                try {
+                  await store.update(activityId, {
+                    status: "failed",
+                    error: `Failed to enqueue execution: ${err instanceof Error ? err.message : String(err)}`,
+                    updatedAt: new Date().toISOString(),
+                  });
+                } catch (updateErr) {
+                  console.error(`[scheduler] failed to mark activity ${activityId} failed for schedule ${schedule.id}:`, updateErr);
+                }
+              }
+              throw err;
+            }
             return {
               status: "submitted",
               message: "schedule enqueued for execution",
@@ -790,13 +814,17 @@ export async function createApiServer(options: ServerOptions) {
       try {
         const result = await sweepRetainedData({
           store,
+          approvalStore: approvals,
           authModule,
           now: Date.now(),
           authSessionDays: sessionDays,
           dailySpendingDays: spendingDays,
           batchSize: 500,
+          onApprovalExpired: async (approval) => {
+            await releaseDecisionReservation(approval.agentId, approval.policyDecision);
+          },
         });
-        console.log(`[retention] sweep complete: auth_sessions=${result.authSessionsRemoved}, daily_spending=${result.dailySpendingRemoved}`);
+        console.log(`[retention] sweep complete: auth_sessions=${result.authSessionsRemoved}, daily_spending=${result.dailySpendingRemoved}, expired_approvals=${result.expiredApprovalsSwept}`);
       } catch (err) {
         console.error("[retention] sweep failed:", err);
       } finally {
@@ -910,7 +938,15 @@ export async function createApiServer(options: ServerOptions) {
     return als.run(requestScopedCtx, () => {
       // Health check is public
       if (method === "GET" && url === "/health") {
-        return json(res, { status: "ok", signerAccountId: options.signer.getAccountId() });
+        const schemaVersion = options.dbPath
+          ? getSchemaVersion(getSharedConnection(options.dbPath))
+          : null;
+        return json(res, {
+          status: "ok",
+          signerAccountId: options.signer.getAccountId(),
+          version: API_VERSION,
+          schemaVersion,
+        });
       }
 
       // Public readiness: bounded/cached dependency reads, fresh worker status.
@@ -1489,12 +1525,65 @@ export async function createApiServer(options: ServerOptions) {
     const schedule = await schedules.get(scheduleId);
     if (!schedule) return apiError(res, "SCHEDULE_NOT_FOUND");
 
-    const patch: any = {};
-    if ((body as any)?.scheduleExpression !== undefined) {
-      const { validateScheduleExpression } = await import("@4evergent/database");
-      const result = validateScheduleExpression((body as any)?.scheduleExpression, schedule.timezone);
+    // Reject any body that contains unknown top-level fields.
+    // Unknown keys are named in the error so the caller can self-correct.
+    const ACCEPTED_FIELDS = new Set(["scheduleExpression", "timezone", "intent"]);
+    const bodyObj = body !== null && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+    const bodyKeys = Object.keys(bodyObj);
+    const unknownKeys = bodyKeys.filter((k) => !ACCEPTED_FIELDS.has(k));
+    if (unknownKeys.length > 0) {
+      return apiError(res, "VALIDATION_ERROR", {
+        message: `unknown field(s): ${unknownKeys.join(", ")}; accepted fields: scheduleExpression, timezone, intent`,
+      });
+    }
+
+    // An empty body carries no update — reject rather than bumping updatedAt for a no-op.
+    if (bodyKeys.length === 0) {
+      return apiError(res, "VALIDATION_ERROR", {
+        message: "body must include at least one of: scheduleExpression, timezone, intent",
+      });
+    }
+
+    const { validateScheduleExpression, validateScheduleIntent } = await import("@4evergent/database");
+    const patch: Partial<ScheduleRecord> = {};
+
+    if (bodyObj.intent !== undefined) {
+      if (typeof bodyObj.intent !== "object" || bodyObj.intent === null || Array.isArray(bodyObj.intent)) {
+        return apiError(res, "VALIDATION_ERROR", { message: "intent must be an object" });
+      }
+      const incomingIntent = bodyObj.intent as Record<string, unknown>;
+      const mergedIntent: Record<string, unknown> = {
+        ...schedule.intent,
+        ...incomingIntent,
+      };
+      if (mergedIntent.asset === "XLM" && incomingIntent.assetDetails === undefined) {
+        delete mergedIntent.assetDetails;
+      }
+      const intentValidation = validateScheduleIntent(mergedIntent as any);
+      if (!intentValidation.valid) {
+        return apiError(res, "VALIDATION_ERROR", { message: intentValidation.error });
+      }
+      patch.intent = mergedIntent as any;
+    }
+
+    if (bodyObj.scheduleExpression !== undefined || bodyObj.timezone !== undefined) {
+      const nextExpression =
+        bodyObj.scheduleExpression !== undefined
+          ? (bodyObj.scheduleExpression as string)
+          : schedule.scheduleExpression;
+      const nextTimezone =
+        bodyObj.timezone !== undefined
+          ? (bodyObj.timezone as string)
+          : schedule.timezone;
+      const result = validateScheduleExpression(nextExpression, nextTimezone);
       if (!result.valid) return apiError(res, "VALIDATION_ERROR", { message: result.error });
-      patch.scheduleExpression = (body as any).scheduleExpression;
+
+      if (bodyObj.scheduleExpression !== undefined) {
+        patch.scheduleExpression = nextExpression;
+      }
+      if (bodyObj.timezone !== undefined) {
+        patch.timezone = nextTimezone;
+      }
       patch.nextRunAt = result.nextRunAt ?? schedule.nextRunAt;
     }
 
@@ -1894,17 +1983,19 @@ export async function createApiServer(options: ServerOptions) {
     const canApprove = await authorizationService.canApprove(ctx, approvalId);
     if (!canApprove) return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
 
+    if (approval.status === "expired" || (approval.expiresAt && new Date(approval.expiresAt) < new Date())) {
+      if (approval.status !== "expired") {
+        await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+        // #353: expired approval will never execute — release the reservation
+        // made when the intent was created.
+        await releaseDecisionReservation(approval.agentId, approval.policyDecision);
+      }
+      return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
+    }
+
     const transitionError = validateApprovalTransition(approval.status, "approved");
     if (transitionError) {
       return approvalError(res, "APPROVAL_INVALID_STATE", { approvalId, activityId: approval.activityId, status: approval.status, message: `cannot approve: ${transitionError}` });
-    }
-
-    if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
-      await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
-      // #353: expired approval will never execute — release the reservation
-      // made when the intent was created.
-      await releaseDecisionReservation(approval.agentId, approval.policyDecision);
-      return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
     // Atomic claim: pending_approval → approved in one conditional step.
@@ -1985,6 +2076,14 @@ export async function createApiServer(options: ServerOptions) {
     const canReject = await authorizationService.canReject(ctx, approvalId);
     if (!canReject) return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
 
+    if (approval.status === "expired" || (approval.expiresAt && new Date(approval.expiresAt) < new Date())) {
+      if (approval.status !== "expired") {
+        await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+        await releaseDecisionReservation(approval.agentId, approval.policyDecision);
+      }
+      return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
+    }
+
     const transitionError = validateApprovalTransition(approval.status, "rejected");
     if (transitionError) {
       return approvalError(res, "APPROVAL_INVALID_STATE", { approvalId, activityId: approval.activityId, status: approval.status, message: `cannot reject: ${transitionError}` });
@@ -2000,7 +2099,7 @@ export async function createApiServer(options: ServerOptions) {
       const current = await approvals.get(approvalId);
       return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
     }
-    await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
+    await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_approver", error: "approval rejected by human" });
     // #353: rejected approval will never execute — release the reservation
     // made when the intent was created.
     await releaseDecisionReservation(approval.agentId, approval.policyDecision);

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
+import userEvent from '@testing-library/user-event';
 import React from 'react';
 import {
   StatusBadge,
@@ -18,6 +19,7 @@ import {
   IntentAmount,
   Button,
   PaginationFooter,
+  ConfirmationModal,
 } from '../index';
 
 describe('Shared UI Components', () => {
@@ -474,5 +476,37 @@ describe('Shared UI Components', () => {
       expect(screen.queryByText('25 shown')).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('ConfirmationModal', () => {
+  it('traps focus, cancels with Escape, and confirms only on request', async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    function Example() {
+      const [open, setOpen] = React.useState(false);
+      return <>
+        <button onClick={() => setOpen(true)}>Open</button>
+        {open && <ConfirmationModal title="Delete this schedule?" actionLabel="Delete"
+          onCancel={() => setOpen(false)} onConfirm={onConfirm} />}
+      </>;
+    }
+    render(<Example />);
+    const trigger = screen.getByRole('button', { name: 'Open' });
+    await user.click(trigger);
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    const submit = screen.getByRole('button', { name: 'Delete' });
+    expect(cancel).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(submit).toHaveFocus();
+    await user.tab();
+    expect(cancel).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(onConfirm).not.toHaveBeenCalled();
+    await user.click(trigger);
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 });

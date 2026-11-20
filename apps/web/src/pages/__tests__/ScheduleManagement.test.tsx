@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { test, expect, describe, vi, beforeEach } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 import { ScheduleManagement } from '../ScheduleManagement';
@@ -455,7 +455,6 @@ describe('ScheduleManagement', () => {
   test('delete confirmation + delete request', async () => {
     mockListSchedules.mockResolvedValue({ schedules: [defaultSchedule] });
     mockDeleteSchedule.mockResolvedValue({ deleted: true });
-    window.confirm = vi.fn(() => true);
 
     render(<MemoryRouter><ScheduleManagement agentId="agent-1" /></MemoryRouter>);
 
@@ -465,7 +464,13 @@ describe('ScheduleManagement', () => {
 
     fireEvent.click(screen.getByText('Delete'));
 
-    expect(window.confirm).toHaveBeenCalledWith('Delete this schedule? This cannot be undone.');
+    const dialog = screen.getByRole('dialog', { name: 'Delete this schedule?' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mockDeleteSchedule).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => {
       expect(mockDeleteSchedule).toHaveBeenCalledWith('agent-1', 'sched-1');
@@ -671,5 +676,50 @@ describe('ScheduleManagement - Schedule Expression Editing', () => {
     });
 
     expect(mockUpdateSchedule).not.toHaveBeenCalled();
+  });
+
+  test('Editing amount and timezone persists and updates row without reload', async () => {
+    mockListSchedules.mockResolvedValue({ schedules: [defaultSchedule] });
+    const updatedSchedule = {
+      ...defaultSchedule,
+      intent: { ...defaultSchedule.intent, amount: '25' },
+      timezone: 'America/New_York',
+      nextRunAt: '2026-01-02T05:00:00Z',
+    };
+    mockUpdateSchedule.mockResolvedValue({ schedule: updatedSchedule });
+
+    render(<MemoryRouter><ScheduleManagement agentId="agent-1" /></MemoryRouter>);
+
+    const editButton = await screen.findByText('Edit');
+    fireEvent.click(editButton);
+
+    const amountInput = screen.getByLabelText('Edit amount') as HTMLInputElement;
+    expect(amountInput.value).toBe('10');
+    fireEvent.change(amountInput, { target: { value: '25' } });
+
+    const tzSelect = screen.getByLabelText('Edit timezone') as HTMLSelectElement;
+    expect(tzSelect.value).toBe('UTC');
+    fireEvent.change(tzSelect, { target: { value: 'America/New_York' } });
+
+    fireEvent.click(screen.getByText('Save'));
+
+    await waitFor(() => {
+      expect(mockUpdateSchedule).toHaveBeenCalledWith('agent-1', 'sched-1', {
+        timezone: 'America/New_York',
+        intent: {
+          type: 'payment',
+          asset: 'XLM',
+          amount: '25',
+          destination: defaultSchedule.intent.destination,
+          reason: defaultSchedule.intent.reason,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText('Edit amount')).not.toBeInTheDocument();
+      expect(screen.getByText(/25 XLM/)).toBeInTheDocument();
+      expect(screen.getByText('America/New_York')).toBeInTheDocument();
+    });
   });
 });

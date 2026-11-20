@@ -146,7 +146,8 @@ export type AuthorizationStatus =
   | "pending_approval"
   | "approved"
   | "denied_by_policy"
-  | "denied_by_simulation";
+  | "denied_by_simulation"
+  | "denied_by_approver";
 
 export interface ActivityRecord {
   id: string;

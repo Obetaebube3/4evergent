@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Approvals from '../Approvals';
 import { test, expect, describe, vi, afterEach } from 'vitest';
@@ -78,28 +78,43 @@ describe('Approvals', () => {
     });
   });
 
+  test('expired approval renders expired badge and no approve/reject buttons', async () => {
+    const expiredAppr = {
+      ...makeApproval('expired', 'agent-exp', '100'),
+      expiresAt: new Date(Date.now() - 3600_000).toISOString(),
+    };
+    mockApi.listApprovals.mockResolvedValue({ approvals: [expiredAppr] });
+    render(<MemoryRouter><Approvals /></MemoryRouter>);
+
+    const row = await screen.findByText('agent-exp').then((el) => el.closest('tr')!);
+    expect(within(row).getByText('expired')).toBeInTheDocument();
+    expect(within(row).queryByText('Approve')).not.toBeInTheDocument();
+    expect(within(row).queryByText('Reject')).not.toBeInTheDocument();
+  });
+
   test('reject button confirms before calling api.reject', async () => {
     mockApi.listApprovals.mockResolvedValue({ approvals: [makeApproval('3', 'agent-c', '5')] });
     mockApi.reject.mockResolvedValue({ approvalId: 'aprv-3', status: 'rejected', message: 'rejected', activityId: 'act-3' });
-    window.confirm = vi.fn(() => true);
 
     render(<MemoryRouter><Approvals /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText('Reject')).toBeInTheDocument());
 
     screen.getByText('Reject').click();
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('Reject this approval'));
+    expect(await screen.findByRole('dialog', { name: 'Reject this approval?' })).toBeInTheDocument();
+    expect(mockApi.reject).not.toHaveBeenCalled();
   });
 
   test('cancel reject does not call api.reject', async () => {
     mockApi.listApprovals.mockResolvedValue({ approvals: [makeApproval('4', 'agent-d', '3')] });
     mockApi.reject.mockResolvedValue({});
-    window.confirm = vi.fn(() => false);
 
     render(<MemoryRouter><Approvals /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText('Reject')).toBeInTheDocument());
 
     screen.getByText('Reject').click();
-    expect(window.confirm).toHaveBeenCalled();
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(mockApi.reject).not.toHaveBeenCalled();
   });
 
@@ -127,12 +142,12 @@ describe('Approvals', () => {
       .mockResolvedValueOnce({ approvals: [makeApproval('6', 'agent-f', '30')] })
       .mockResolvedValueOnce({ approvals: [] });
     mockApi.reject.mockResolvedValue({ approvalId: 'aprv-6', status: 'rejected', message: 'rejected', activityId: 'act-6' });
-    window.confirm = vi.fn(() => true);
 
     render(<MemoryRouter><Approvals /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText('Reject')).toBeInTheDocument());
 
     screen.getByText('Reject').click();
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Reject' }));
 
     await waitFor(() => {
       expect(mockApi.listApprovals).toHaveBeenCalledTimes(2);
@@ -162,12 +177,12 @@ describe('Approvals', () => {
   test('failed reject does not remove the row and terminates loading state', async () => {
     mockApi.listApprovals.mockResolvedValue({ approvals: [makeApproval('8', 'agent-h', '15')] });
     mockApi.reject.mockRejectedValue(new Error('409: conflict'));
-    window.confirm = vi.fn(() => true);
 
     render(<MemoryRouter><Approvals /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText('Reject')).toBeInTheDocument());
 
     screen.getByText('Reject').click();
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Reject' }));
 
     await waitFor(() => {
       expect(screen.getByText('Reject')).toBeEnabled();
